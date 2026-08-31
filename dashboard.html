@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<title>VSA AUTONOMOUS DASHBOARD</title>
+<link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+:root{--bg0:#0b0e14;--bg1:#12161f;--bg2:#1a1f2c;--line:#242c3d;--txt:#dfe3ec;--dim:#78829a;--green:#17d2ad;--red:#f6465d;--amber:#f0b90b;--purple:#8b7cf6;}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'JetBrains Mono',monospace;background:var(--bg0);color:var(--txt);padding:20px;display:grid;grid-template-columns:2fr 1fr;gap:20px;min-height:100vh;}
+.hdr{grid-column:1/-1;display:flex;align-items:center;justify-content:space-between;border-bottom:2px solid var(--line);padding-bottom:10px;margin-bottom:10px;}
+.hdr h1{font-family:'Chakra Petch',sans-serif;letter-spacing:2px;color:var(--amber);}
+.stat-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:15px;grid-column:1/-1;margin-bottom:20px;}
+.stat{background:var(--bg1);border:1px solid var(--line);padding:15px;border-radius:6px;}
+.stat label{font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:1px;}
+.stat val{display:block;font-size:24px;font-weight:700;margin-top:5px;font-family:'Chakra Petch',sans-serif;}
+.stat.up val{color:var(--green);} .stat.dn val{color:var(--red);}
+
+.panel{background:var(--bg1);border:1px solid var(--line);border-radius:8px;display:flex;flex-direction:column;min-height:500px;}
+.panel-hdr{padding:12px 15px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:8px;font-family:'Chakra Petch',sans-serif;font-weight:700;letter-spacing:1px;text-transform:uppercase;font-size:13px;color:var(--purple);}
+.panel-body{padding:15px;overflow-y:auto;flex:1;}
+
+.trade{background:var(--bg2);border-left:4px solid var(--green);padding:12px;margin-bottom:15px;border-radius:4px;font-size:11px;}
+.trade.short{border-left-color:var(--red);}
+.trade-meta{display:flex;justify-content:space-between;margin-bottom:8px;color:var(--dim);font-size:10px;}
+.chk-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-top:10px;border-top:1px solid var(--line);padding-top:10px;}
+.chk{text-align:center;font-size:9px;color:var(--dim);}
+.chk span{display:block;font-size:14px;color:var(--green);font-weight:700;}
+.chk.fail span{color:var(--red);}
+
+.ai-msg{background:rgba(139,124,246,.08);border:1px solid rgba(139,124,246,.2);padding:12px;border-radius:6px;font-size:11px;line-height:1.6;margin-bottom:15px;}
+.ai-msg b{color:var(--purple);}
+</style>
+</head>
+<body>
+
+<div class="hdr">
+  <h1>VSA AUTONOMOUS TERMINAL</h1>
+  <div style="font-size:10px;color:var(--dim);">STATUS: <span style="color:var(--green);">● LIVE EXECUTION</span></div>
+</div>
+
+<div class="stat-grid">
+  <div class="stat up"><label>EQUITY</label><val>$5,142.50</val></div>
+  <div class="stat"><label>OPEN POSITIONS</label><val>1</val></div>
+  <div class="stat up"><label>WIN RATE (30D)</label><val>68%</val></div>
+  <div class="stat"><label>MAX DRAWDOWN</label><val>4.2%</val></div>
+</div>
+
+<div class="panel">
+  <div class="panel-hdr">EXECUTION LOG & RISK CONFIG</div>
+  <div class="panel-body">
+    <div class="trade">
+      <div class="trade-meta"><span>LONG BTCUSDT @ $64,250.0</span><span>15M VP RETEST</span></div>
+      <div>Entry Logic: Price touched weekly PoC after a 3-day retest. 4H confirmed rejection wick. Marked <b style="color:var(--amber)">HIGH PROBABILITY</b>.</div>
+      <div class="chk-grid">
+        <div class="chk">CHECK 1 (VP)<span>✓</span></div>
+        <div class="chk">CHECK 2 (ADX)<span>✓</span></div>
+        <div class="chk">CHECK 3 (FLOW)<span>✓</span></div>
+      </div>
+      <div style="margin-top:10px; display:flex; justify-content:space-between; color:var(--dim);">
+        <span>SL: $63,910 <span style="color:var(--red)">(0.5 ATR)</span></span>
+        <span>TP: $65,100 <span style="color:var(--green)">(FIB 0.618)</span></span>
+      </div>
+    </div>
+
+    <div class="trade short">
+      <div class="trade-meta"><span>SHORT ETHUSDT @ $3,450.0</span><span>CLOSED +2.1R</span></div>
+      <div>Entry Logic: Short at VAH. ADX > 20. Absorption bubble detected on upper wick.</div>
+      <div class="chk-grid">
+        <div class="chk">CHECK 1 (VP)<span>✓</span></div>
+        <div class="chk">CHECK 2 (ADX)<span>✓</span></div>
+        <div class="chk">CHECK 3 (FLOW)<span>✓</span></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="panel">
+  <div class="panel-hdr">AI PORTFOLIO ANALYST</div>
+  <div class="panel-body">
+    <div class="ai-msg">
+      <b>SYSTEM STATE:</b> Current exposure is 12% of equity at 15x leverage. Risk of ruin is minimal. 
+      <br><br>
+      <b>MACRO OVERLAY:</b> The recent 3D swing high on BTC was established during low-liquidity weekend hours. The FIB 0.618 TP target aligns perfectly with the 4H EMA200. 
+      <br><br>
+      <b>RECOMMENDATION:</b> The trailing SL activation at 1.2R is mathematically sound for current 15m volatility. However, the ATR multiplier for your initial SL is slightly tight for weekend gaps. Consider increasing to 0.7 ATR if holding positions through Sunday UTC reset.
+    </div>
+  </div>
+</div>
+
+</body>
+</html>
