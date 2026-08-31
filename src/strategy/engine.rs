@@ -3,24 +3,36 @@ use chrono::{Datelike, TimeZone, Utc};
 use log::{info, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 
 use crate::config::Config;
 use crate::exchange::binance::BinanceClient;
 use crate::exchange::types::OrderRequest;
 use crate::risk::manager::PositionManager;
+use crate::tradelog::{TradeLog, TradeRecord};
 
 use super::indicators::*;
 use super::orderflow::{detect_absorption, Candle};
 
 const SYMBOL: &str = "BTCUSDT";
-const TAP_TOLERANCE: f64 = 0.001; // 0.1% counts as a tap
+const TAP_TOLERANCE: f64 = 0.001;
 const MIN_BUBBLE_SIZE: f64 = 1.5;
 const ATR_SL_MULT: f64 = 0.5;
+const TRADES_FILE: &str = "trades.json";
 
 #[derive(Debug, Clone)]
 struct TapRecord {
     taps: u32,
     confirmed_4h: bool,
+}
+
+#[derive(Debug, Clone)]
+struct EntryMeta {
+    level_name: String,
+    rr: f64,
+    high_prob: bool,
+    adx: f64,
+    bubble_size: f64,
 }
 
 enum PosState {
@@ -32,6 +44,7 @@ enum PosState {
         sl: f64,
         tp: f64,
         qty: f64,
+        meta: EntryMeta,
     },
     Open {
         pm: PositionManager,
@@ -41,24 +54,39 @@ enum PosState {
 
 pub struct Engine {
     cfg: Arc<Config>,
-    client: BinanceClient,
+    client: Arc<BinanceClient>,
     state: PosState,
-    taps: HashMap<u64, TapRecord>, // key: level price rounded to $1
+    taps: HashMap<u64, TapRecord>,
     last_eval_ts: u64,
+    trades: TradeLog,
+    open_idx: Option<usize>,
+    shared_trades: Arc<RwLock<Vec<TradeRecord>>>,
 }
 
 impl Engine {
-    pub fn new(cfg: Arc<Config>, client: BinanceClient) -> Self {
+    pub fn new(
+        cfg: Arc<Config>,
+        client: Arc<BinanceClient>,
+        shared_trades: Arc<RwLock<Vec<TradeRecord>>>,
+    ) -> Self {
         Self {
             cfg,
             client,
             state: PosState::Flat,
             taps: HashMap::new(),
             last_eval_ts: 0,
+            trades: TradeLog::load(TRADES_FILE),
+            open_idx: None,
+            shared_trades,
         }
     }
 
+    async fn sync_trades(&self) {
+        *self.shared_trades.write().await = self.trades.trades.clone();
+    }
+
     pub async fn run(&mut self) -> Result<()> {
+        self.sync_trades().await;
         self.client
             .set_leverage(SYMBOL, self.cfg.max_leverage as u32)
             .await?;
@@ -66,7 +94,7 @@ impl Engine {
 
         loop {
             let now = Utc::now().timestamp() as u64;
-            let candle_boundary = now - (now % 900); // 15m boundary
+            let candle_boundary = now - (now % 900);
 
             match &self.state {
                 PosState::Flat => {
@@ -92,7 +120,8 @@ impl Engine {
         }
     }
 
-    /// On boot: reconcile with exchange — never trust local memory after a Render restart
+    /// On boot: reconcile with exchange — never trust local memory after a Render restart.
+    /// Note: rehydrated positions have no trade-log entry (open_idx = None).
     async fn rehydrate(&mut self) -> Result<()> {
         let pos = self.client.position_risk(SYMBOL).await?;
         let (amt, entry): (f64, f64) = pos
@@ -109,8 +138,6 @@ impl Engine {
         if amt.abs() > 0.0 {
             info!("rehydrated open position: {amt} @ {entry}");
             let is_long = amt > 0.0;
-            // conservative reconstruction: SL/TP re-derived; exchange stop orders
-            // (if still resting) remain authoritative
             let mut pm = PositionManager::new(
                 &self.cfg,
                 0.0,
@@ -132,7 +159,7 @@ impl Engine {
         // ---- data ----
         let k15 = self.client.fetch_klines(SYMBOL, "15m", 400).await?;
         let mut c15 = parse_klines(&k15);
-        c15.pop(); // drop forming candle
+        c15.pop();
 
         let k1h = self.client.fetch_klines(SYMBOL, "1h", 200).await?;
         let c1h = parse_klines(&k1h);
@@ -161,7 +188,7 @@ impl Engine {
             vec![(vp.poc, false, "PoC"), (vp.val, true, "VAL")]
         };
 
-        let mut tapped: Vec<(f64, bool, String)> = Vec::new();
+        let mut tapped: Vec<(f64, bool, String, bool)> = Vec::new();
         for (level, is_long, name) in candidates {
             if (price - level).abs() / level <= TAP_TOLERANCE {
                 let confirmed_4h = confirm_4h(&c4h, level, is_long);
@@ -176,36 +203,50 @@ impl Engine {
                 }
                 let hp = rec.taps > 1 && rec.confirmed_4h;
                 info!("TAP {name} @ {level:.1} | 4h:{confirmed_4h} | high_prob:{hp}");
-                tapped.push((level, is_long, name.to_string()));
+                tapped.push((level, is_long, name.to_string(), hp));
             }
         }
         if tapped.is_empty() {
             return Ok(());
         }
-        let (level, is_long, lvl_name) = tapped.remove(0);
+        let (level, is_long, lvl_name, high_prob) = tapped.remove(0);
 
-        // ---- checkmark 2: ADX 15m rising > 20 ----
-        let adx = calc_adx(&c15, 14);
-        let cur_adx = match adx.last().copied().flatten() {
+        // ---- checkmark 2: ADX 15m rising > 20 + DI alignment ----
+        let bars = calc_adx(&c15, 14);
+        let cur = match bars.last() {
+            Some(b) => b,
+            None => return Ok(()),
+        };
+        let prev_adx = match bars
+            .get(bars.len().saturating_sub(2))
+            .and_then(|b| b.adx)
+        {
             Some(a) => a,
             None => return Ok(()),
         };
-        let prev_adx = match adx.get(adx.len().saturating_sub(2)).copied().flatten() {
+        let cur_adx = match cur.adx {
             Some(a) => a,
             None => return Ok(()),
         };
         if !(cur_adx > 20.0 && cur_adx > prev_adx) {
             return Ok(());
         }
-        // TODO next pass: +DI/-DI directional filter (needs DI output from calc_adx)
+        let (pdi, mdi) = match (cur.plus_di, cur.minus_di) {
+            (Some(a), Some(b)) => (a, b),
+            _ => return Ok(()),
+        };
+        let di_ok = if is_long { pdi > mdi } else { mdi > pdi };
+        if !di_ok {
+            return Ok(());
+        }
 
         // ---- checkmark 3: absorption bubble in trade direction ----
         let bubbles = detect_absorption(&c15, 100);
         let want = if is_long { "B" } else { "S" };
-        let confirmed = bubbles
-            .last()
-            .map(|b| matches!(b, Some(x) if x.side == want && x.size >= MIN_BUBBLE_SIZE))
-            .unwrap_or(false);
+        let (confirmed, bubble_size) = match bubbles.last().and_then(|b| b.as_ref()) {
+            Some(b) if b.side == want => (b.size >= MIN_BUBBLE_SIZE, b.size),
+            _ => (false, 0.0),
+        };
         if !confirmed {
             return Ok(());
         }
@@ -222,7 +263,6 @@ impl Engine {
             level + ATR_SL_MULT * atr
         };
 
-        // FIB GP off 3D swing — TP only if >= 2R
         let (swing_h, swing_l) = match find_3d_swing(&c15) {
             Some(s) => s,
             None => return Ok(()),
@@ -235,6 +275,7 @@ impl Engine {
             info!("FIB GP rejected: RR {} < 2.0", reward / risk);
             return Ok(());
         }
+        let rr = reward / risk;
 
         // ---- sizing + entry ----
         let equity = self.equity().await?;
@@ -260,9 +301,7 @@ impl Engine {
             .await?;
         let order_id = resp["orderId"].as_u64().unwrap_or(0);
 
-        info!(
-            "ENTRY {side} {lvl_name} @ {level:.1} qty={qty} SL={sl:.1} TP={tp:.1}"
-        );
+        info!("ENTRY {side} {lvl_name} @ {level:.1} qty={qty} SL={sl:.1} TP={tp:.1} RR={rr:.2}");
         self.state = PosState::PendingEntry {
             side: side.into(),
             order_id,
@@ -270,12 +309,19 @@ impl Engine {
             sl,
             tp,
             qty,
+            meta: EntryMeta {
+                level_name: lvl_name,
+                rr,
+                high_prob,
+                adx: cur_adx,
+                bubble_size,
+            },
         };
         Ok(())
     }
 
     async fn check_fill(&mut self) -> Result<()> {
-        let (order_id, side, entry, sl, tp, qty) = match &self.state {
+        let (order_id, side, entry, sl, tp, qty, meta) = match &self.state {
             PosState::PendingEntry {
                 order_id,
                 side,
@@ -283,7 +329,8 @@ impl Engine {
                 sl,
                 tp,
                 qty,
-            } => (*order_id, side.clone(), *entry, *sl, *tp, *qty),
+                meta,
+            } => (*order_id, side.clone(), *entry, *sl, *tp, *qty, meta.clone()),
             _ => return Ok(()),
         };
         let status = self.client.order_status(SYMBOL, order_id).await?;
@@ -292,7 +339,6 @@ impl Engine {
         if st == "FILLED" {
             let stop_side = if side == "BUY" { "SELL" } else { "BUY" };
 
-            // exchange-side SL — survives Render sleep
             let resp = self
                 .client
                 .place_order(&OrderRequest {
@@ -308,7 +354,6 @@ impl Engine {
                 .await?;
             let stop_id = resp["orderId"].as_u64().unwrap_or(0);
 
-            // exchange-side TP too — engine may be asleep when it hits
             if let Err(e) = self
                 .client
                 .place_order(&OrderRequest {
@@ -326,6 +371,28 @@ impl Engine {
                 warn!("TP order failed (local fallback covers): {e}");
             }
 
+            let rec = TradeRecord {
+                opened_at: Utc::now().timestamp() as u64,
+                closed_at: None,
+                symbol: SYMBOL.into(),
+                side: side.clone(),
+                level: meta.level_name,
+                entry,
+                initial_sl: sl,
+                tp,
+                qty,
+                rr: meta.rr,
+                high_prob: meta.high_prob,
+                adx: meta.adx,
+                bubble_size: meta.bubble_size,
+                status: "OPEN".into(),
+                exit_price: None,
+                pnl_r: None,
+            };
+            let idx = self.trades.record_open(rec);
+            self.open_idx = Some(idx);
+            self.sync_trades().await;
+
             let pm = PositionManager::new(&self.cfg, 0.0, entry, sl, tp, side == "BUY");
             self.state = PosState::Open {
                 pm,
@@ -338,8 +405,6 @@ impl Engine {
         Ok(())
     }
 
-    /// Local logic amends the exchange stop: BE at 1R, trail at 1.2R.
-    /// Exchange orders are the source of truth; local state is advisory.
     async fn manage(&mut self) -> Result<()> {
         let price = self.client.mark_price(SYMBOL).await?;
         let pos = self.client.position_risk(SYMBOL).await?;
@@ -352,10 +417,15 @@ impl Engine {
 
         // exchange stop/TP already fired (possibly while instance slept)
         if amt.abs() == 0.0 {
-            if matches!(self.state, PosState::Open { .. }) {
-                info!("position closed by exchange orders — going flat");
-                self.state = PosState::Flat;
+            if let PosState::Open { pm, .. } = &self.state {
+                let status = classify_exit(pm, price);
+                if let Some(idx) = self.open_idx.take() {
+                    self.trades.record_close(idx, price, status);
+                    self.sync_trades().await;
+                }
+                info!("position closed by exchange orders ({status}) — going flat");
             }
+            self.state = PosState::Flat;
             return Ok(());
         }
 
@@ -365,8 +435,8 @@ impl Engine {
         };
 
         if exit_now {
-            let (qty, is_long) = match &self.state {
-                PosState::Open { pm, .. } => (pm.qty, pm.is_long),
+            let (qty, is_long, status) = match &self.state {
+                PosState::Open { pm, .. } => (pm.qty, pm.is_long, classify_exit(pm, price)),
                 _ => return Ok(()),
             };
             self.client
@@ -382,7 +452,11 @@ impl Engine {
                 })
                 .await
                 .ok();
-            info!("EXIT signal @ ~{price:.1} — flattened");
+            if let Some(idx) = self.open_idx.take() {
+                self.trades.record_close(idx, price, status);
+                self.sync_trades().await;
+            }
+            info!("EXIT signal @ ~{price:.1} ({status}) — flattened");
             self.state = PosState::Flat;
             return Ok(());
         }
@@ -436,6 +510,19 @@ impl Engine {
     }
 }
 
+fn classify_exit(pm: &PositionManager, exit_price: f64) -> &'static str {
+    if pm.trailing_active {
+        return "TRAIL";
+    }
+    if pm.is_long {
+        if exit_price >= pm.tp * 0.999 { "TP" } else { "SL" }
+    } else if exit_price <= pm.tp * 1.001 {
+        "TP"
+    } else {
+        "SL"
+    }
+}
+
 // ---- helpers ----
 fn parse_klines(raw: &[serde_json::Value]) -> Vec<Candle> {
     raw.iter()
@@ -456,7 +543,7 @@ fn parse_klines(raw: &[serde_json::Value]) -> Vec<Candle> {
 
 fn week_start_ms() -> u64 {
     let now = Utc::now();
-    let dow = now.weekday().num_days_from_sunday(); // Sun=0
+    let dow = now.weekday().num_days_from_sunday();
     let sunday = now.date_naive() - chrono::Duration::days(dow as i64);
     Utc.from_utc_datetime(&sunday.and_hms_opt(0, 0, 0).unwrap())
         .timestamp_millis() as u64
@@ -473,5 +560,5 @@ fn confirm_4h(c4h: &[Candle], level: f64, is_long: bool) -> bool {
 }
 
 fn round_qty(q: f64) -> f64 {
-    (q * 1000.0).floor() / 1000.0 // BTCUSDT stepSize 0.001
+    (q * 1000.0).floor() / 1000.0
 }
