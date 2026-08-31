@@ -1,10 +1,19 @@
 use super::orderflow::Candle;
 
-/// Wilder's smoothing ADX
-pub fn calc_adx(candles: &[Candle], period: usize) -> Vec<Option<f64>> {
+#[derive(Debug, Clone)]
+pub struct AdxBar {
+    pub adx: Option<f64>,
+    pub plus_di: Option<f64>,
+    pub minus_di: Option<f64>,
+}
+
+/// Wilder's smoothing ADX + directional indicators
+pub fn calc_adx(candles: &[Candle], period: usize) -> Vec<AdxBar> {
     let n = candles.len();
-    let mut adx = vec![None; n];
-    if n < period * 2 { return adx; }
+    let mut out: Vec<AdxBar> = vec![AdxBar { adx: None, plus_di: None, minus_di: None }; n];
+    if n < period * 2 + 1 {
+        return out;
+    }
 
     let mut tr_s = vec![0.0; n];
     let mut plus_dm_s = vec![0.0; n];
@@ -23,7 +32,6 @@ pub fn calc_adx(candles: &[Candle], period: usize) -> Vec<Option<f64>> {
         minus_dm_s[i] = if down_move > up_move && down_move > 0.0 { down_move } else { 0.0 };
     }
 
-    // Wilder smoothing
     let mut tr_w = vec![0.0; n];
     let mut pdm_w = vec![0.0; n];
     let mut mdm_w = vec![0.0; n];
@@ -32,36 +40,46 @@ pub fn calc_adx(candles: &[Candle], period: usize) -> Vec<Option<f64>> {
         pdm_w[period] += plus_dm_s[i];
         mdm_w[period] += minus_dm_s[i];
     }
-    for i in (period + 1)..n {
-        tr_w[i] = tr_w[i - 1] - (tr_w[i - 1] / period as f64) + tr_s[i];
-        pdm_w[i] = pdm_w[i - 1] - (pdm_w[i - 1] / period as f64) + plus_dm_s[i];
-        mdm_w[i] = mdm_w[i - 1] - (mdm_w[i - 1] / period as f64) + minus_dm_s[i];
 
-        let plus_di = 100.0 * pdm_w[i] / tr_w[i];
-        let minus_di = 100.0 * mdm_w[i] / tr_w[i];
-        let di_sum = plus_di + minus_di;
-        dx[i] = if di_sum > 0.0 { 100.0 * (plus_di - minus_di).abs() / di_sum } else { 0.0 };
+    for i in period..n {
+        if i > period {
+            tr_w[i] = tr_w[i - 1] - (tr_w[i - 1] / period as f64) + tr_s[i];
+            pdm_w[i] = pdm_w[i - 1] - (pdm_w[i - 1] / period as f64) + plus_dm_s[i];
+            mdm_w[i] = mdm_w[i - 1] - (mdm_w[i - 1] / period as f64) + minus_dm_s[i];
+        }
+        if tr_w[i] > 0.0 {
+            let pdi = 100.0 * pdm_w[i] / tr_w[i];
+            let mdi = 100.0 * mdm_w[i] / tr_w[i];
+            out[i].plus_di = Some(pdi);
+            out[i].minus_di = Some(mdi);
+            let s = pdi + mdi;
+            dx[i] = if s > 0.0 { 100.0 * (pdi - mdi).abs() / s } else { 0.0 };
+        }
     }
 
-    // ADX = Wilder smoothed DX
     let start = period * 2;
+    if start >= n {
+        return out;
+    }
     let mut adx_sum = 0.0;
     for i in (period + 1)..=start {
         adx_sum += dx[i];
     }
-    adx[start] = Some(adx_sum / period as f64);
+    out[start].adx = Some(adx_sum / period as f64);
     for i in (start + 1)..n {
-        let prev = adx[i - 1].unwrap_or(0.0);
-        adx[i] = Some((prev * (period as f64 - 1.0) + dx[i]) / period as f64);
+        let prev = out[i - 1].adx.unwrap_or(0.0);
+        out[i].adx = Some((prev * (period as f64 - 1.0) + dx[i]) / period as f64);
     }
-    adx
+    out
 }
 
 /// ATR with Wilder smoothing
 pub fn calc_atr(candles: &[Candle], period: usize) -> Vec<Option<f64>> {
     let n = candles.len();
     let mut atr = vec![None; n];
-    if n < period + 1 { return atr; }
+    if n < period + 1 {
+        return atr;
+    }
 
     let mut tr = vec![0.0; n];
     for i in 1..n {
@@ -91,7 +109,9 @@ pub struct VpLevels {
 }
 
 pub fn calc_volume_profile(candles: &[Candle], bin_size: f64) -> Option<VpLevels> {
-    if candles.is_empty() { return None; }
+    if candles.is_empty() {
+        return None;
+    }
 
     let mut min_p = f64::MAX;
     let mut max_p = f64::MIN;
@@ -109,11 +129,15 @@ pub fn calc_volume_profile(candles: &[Candle], bin_size: f64) -> Option<VpLevels
         if idx < bin_count { bins[idx] += c.volume; }
     }
 
-    let poc_idx = bins.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).map(|(i, _)| i)?;
+    let poc_idx = bins
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        .map(|(i, _)| i)?;
     let poc = min_p + poc_idx as f64 * bin_size + bin_size / 2.0;
 
     let total_vol: f64 = bins.iter().sum();
-    let target_vol = total_vol * 0.70; // 70% value area
+    let target_vol = total_vol * 0.70;
     let mut acc_vol = bins[poc_idx];
     let mut up_idx = poc_idx;
     let mut dn_idx = poc_idx;
@@ -142,7 +166,9 @@ pub fn calc_volume_profile(candles: &[Candle], bin_size: f64) -> Option<VpLevels
 /// 3D Swing High/Low (last 288 x 15m candles)
 pub fn find_3d_swing(candles: &[Candle]) -> Option<(f64, f64)> {
     let window = candles.len().min(288);
-    if window == 0 { return None; }
+    if window == 0 {
+        return None;
+    }
     let slice = &candles[candles.len() - window..];
     let high = slice.iter().map(|c| c.high).fold(f64::MIN, f64::max);
     let low = slice.iter().map(|c| c.low).fold(f64::MAX, f64::min);
