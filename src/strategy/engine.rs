@@ -16,7 +16,7 @@ use super::orderflow::{detect_absorption, Candle};
 
 const SYMBOL: &str = "BTCUSDT";
 const TAP_TOLERANCE: f64 = 0.001;
-const MIN_BUBBLE_SIZE: f64 = 1.5;
+const MIN_BUBBLE_SIZE: f64 = 1.0;
 const ATR_SL_MULT: f64 = 0.5;
 const TRADES_FILE: &str = "trades.json";
 
@@ -120,8 +120,6 @@ impl Engine {
         }
     }
 
-    /// On boot: reconcile with exchange — never trust local memory after a Render restart.
-    /// Note: rehydrated positions have no trade-log entry (open_idx = None).
     async fn rehydrate(&mut self) -> Result<()> {
         let pos = self.client.position_risk(SYMBOL).await?;
         let (amt, entry): (f64, f64) = pos
@@ -159,7 +157,7 @@ impl Engine {
         // ---- data ----
         let k15 = self.client.fetch_klines(SYMBOL, "15m", 400).await?;
         let mut c15 = parse_klines(&k15);
-        c15.pop();
+        let forming = c15.pop(); // excluded from ADX/ATR, included in bubble scan
 
         let k1h = self.client.fetch_klines(SYMBOL, "1h", 200).await?;
         let c1h = parse_klines(&k1h);
@@ -217,10 +215,7 @@ impl Engine {
             Some(b) => b,
             None => return Ok(()),
         };
-        let prev_adx = match bars
-            .get(bars.len().saturating_sub(2))
-            .and_then(|b| b.adx)
-        {
+        let prev_adx = match bars.get(bars.len().saturating_sub(2)).and_then(|b| b.adx) {
             Some(a) => a,
             None => return Ok(()),
         };
@@ -241,13 +236,20 @@ impl Engine {
         }
 
         // ---- checkmark 3: absorption bubble in trade direction ----
-        let bubbles = detect_absorption(&c15, 100);
+        // window = last 4 candles incl. forming (what you see live on the terminal)
+        let mut bubble_src = c15.clone();
+        if let Some(f) = forming {
+            bubble_src.push(f);
+        }
+        let bubbles = detect_absorption(&bubble_src, 100);
         let want = if is_long { "B" } else { "S" };
-        let (confirmed, bubble_size) = match bubbles.last().and_then(|b| b.as_ref()) {
-            Some(b) if b.side == want => (b.size >= MIN_BUBBLE_SIZE, b.size),
-            _ => (false, 0.0),
-        };
-        if !confirmed {
+        let mut bubble_size = 0.0;
+        for b in bubbles.iter().rev().take(4).flatten() {
+            if b.side == want && b.size > bubble_size {
+                bubble_size = b.size;
+            }
+        }
+        if bubble_size < MIN_BUBBLE_SIZE {
             return Ok(());
         }
 
@@ -415,7 +417,6 @@ impl Engine {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.0);
 
-        // exchange stop/TP already fired (possibly while instance slept)
         if amt.abs() == 0.0 {
             if let PosState::Open { pm, .. } = &self.state {
                 let status = classify_exit(pm, price);
@@ -461,7 +462,6 @@ impl Engine {
             return Ok(());
         }
 
-        // amend SL only when it moved meaningfully (> 0.05%) — no amend spam
         let (old_sl, new_sl, stop_id, is_long, qty) = match &mut self.state {
             PosState::Open { pm, stop_order_id } => {
                 let old = pm.initial_sl;
@@ -523,7 +523,6 @@ fn classify_exit(pm: &PositionManager, exit_price: f64) -> &'static str {
     }
 }
 
-// ---- helpers ----
 fn parse_klines(raw: &[serde_json::Value]) -> Vec<Candle> {
     raw.iter()
         .filter_map(|k| {
